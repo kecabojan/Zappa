@@ -28,7 +28,9 @@ import slugify
 import string
 import sys
 import tempfile
+import time
 import zipfile
+from dateutil import parser
 from datetime import datetime,timedelta
 from zappa import Zappa, logger
 from util import detect_django_settings, detect_flask_apps
@@ -37,7 +39,8 @@ CUSTOM_SETTINGS = [
     'assume_policy',
     'attach_policy',
     'aws_region',
-    'delete_zip',
+    'delete_local_zip',
+    'delete_s3_zip',
     'exclude',
     'http_methods',
     'integration_response_codes',
@@ -104,7 +107,11 @@ class ZappaCLI(object):
     @property
     def stage_config(self):
         """A shortcut property for settings of staging."""
-        return self.zappa_settings[self.api_stage]
+        # Backwards compatible for delete_zip setting that was more explicitly named delete_local_zip
+        settings = self.zappa_settings[self.api_stage]
+        if u'delete_zip' in settings:
+            settings[u'delete_local_zip'] = settings.get(u'delete_zip')
+        return settings
 
     def handle(self, argv=None):
         """
@@ -149,10 +156,14 @@ class ZappaCLI(object):
             print("The command '{}' is not recognized. {}".format(command, help_message))
             return
 
+        # Settings-based interactions will fail
+        # before a project has been initialized.
         if command != 'init':
-            if len(command_env) < 2: # pragma: no cover
-                self.load_settings_file(vargs['settings_file'])
 
+             # Load and Validate Settings File
+            self.load_settings_file(vargs['settings_file'])
+
+            if len(command_env) < 2: # pragma: no cover
                 # If there's only one environment defined in the settings,
                 # use that as the default.
                 if len(self.zappa_settings.keys()) is 1:
@@ -163,12 +174,12 @@ class ZappaCLI(object):
             else:
                 self.api_stage = command_env[1]
 
+            if vargs['app_function'] is not None:
+                self.app_function = vargs['app_function']
+
             # Load our settings
             self.load_settings(vargs['settings_file'])
             self.callback('settings')
-
-            if vargs['app_function'] is not None:
-                self.app_function = vargs['app_function']
 
         # Hand it off
         if command == 'deploy': # pragma: no cover
@@ -267,9 +278,20 @@ class ZappaCLI(object):
 
         endpoint_url = ''
         if self.use_apigateway:
+
+            if self.iam_authorization:
+                auth_type = "AWS_IAM"
+            else:
+                auth_type = "NONE"
+
             # Create and configure the API Gateway
             api_id = self.zappa.create_api_gateway_routes(
-                self.lambda_arn, self.lambda_name, self.api_key_required, self.integration_content_type_aliases)
+                self.lambda_arn,
+                self.lambda_name,
+                self.api_key_required,
+                self.integration_content_type_aliases,
+                auth_type,
+            )
 
             # Deploy the API!
             cache_cluster_enabled = self.stage_config.get('cache_cluster_enabled', False)
@@ -295,15 +317,16 @@ class ZappaCLI(object):
                 requests.get(endpoint_url)
 
         # Finally, delete the local copy our zip package
-        if self.stage_config.get('delete_zip', True):
-            os.remove(self.zip_path)
+        if self.stage_config.get('delete_local_zip', True):
+            self.remove_local_zip()
 
         # Remove the uploaded zip from S3, because it is now registered..
-        self.zappa.remove_from_s3(self.zip_path, self.s3_bucket_name)
+        if self.stage_config.get('delete_s3_zip', True):
+            self.zappa.remove_from_s3(self.zip_path, self.s3_bucket_name)
 
         self.callback('post')
 
-        print("Deployed! {}".format(endpoint_url))
+        click.echo(click.style("Deployment complete", fg="green", bold=True) + "!: {}".format(endpoint_url))
 
 
     def update(self):
@@ -314,6 +337,20 @@ class ZappaCLI(object):
         # Execute the prebuild script
         if self.prebuild_script:
             self.execute_prebuild_script()
+
+        # Temporary version check
+        try:
+            updated_time = 1472581018
+            function_response = self.zappa.lambda_client.get_function(FunctionName=self.lambda_name)
+            conf = function_response['Configuration']
+            last_updated = parser.parse(conf['LastModified'])
+            last_updated_unix = time.mktime(last_updated.timetuple())
+        except Exception as e:
+            click.echo(click.style("Warning!", fg="red") + " Couldn't get function - have you deployed yet?")
+            return
+
+        if last_updated_unix <= updated_time:
+            click.echo(click.style("Warning!", fg="red") + " You may have upgraded Zappa since deploying this application. You will need to " + click.style("redeploy", bold=True) + " for this deployment to work properly!")
 
         # Make sure the necessary IAM execution roles are available
         if self.manage_roles:
@@ -335,7 +372,8 @@ class ZappaCLI(object):
             self.s3_bucket_name, self.zip_path, self.lambda_name)
 
         # Remove the uploaded zip from S3, because it is now registered..
-        self.zappa.remove_from_s3(self.zip_path, self.s3_bucket_name)
+        if self.stage_config.get('delete_s3_zip', True):
+            self.zappa.remove_from_s3(self.zip_path, self.s3_bucket_name)
 
         # Update the configuration, in case there are changes.
         self.lambda_arn = self.zappa.update_lambda_configuration(lambda_arn=self.lambda_arn,
@@ -347,8 +385,8 @@ class ZappaCLI(object):
                                                        memory_size=self.memory_size)
 
         # Finally, delete the local copy our zip package
-        if self.stage_config.get('delete_zip', True):
-            os.remove(self.zip_path)
+        if self.stage_config.get('delete_local_zip', True):
+            self.remove_local_zip()
 
         if self.stage_config.get('domain', None):
             endpoint_url = self.stage_config.get('domain')
@@ -369,7 +407,25 @@ class ZappaCLI(object):
 
         if endpoint_url and 'https://' not in endpoint_url:
             endpoint_url = 'https://' + endpoint_url
-        click.echo("Your updated Zappa deployment is " + click.style("live", fg='green', bold=True) + "!: {}".format(endpoint_url))
+
+        deployed_string = "Your updated Zappa deployment is " + click.style("live", fg='green', bold=True) + "!: " + click.style("{}".format(endpoint_url), bold=True)
+        
+        api_url = None
+        if endpoint_url and 'amazonaws.com' not in endpoint_url:
+            api_url = self.zappa.get_api_url(
+                self.lambda_name,
+                self.api_stage)
+
+            if endpoint_url != api_url:
+                deployed_string = deployed_string + " (" + api_url + ")"
+
+        if self.stage_config.get('touch', True):
+            if api_url:
+                requests.get(api_url)
+            elif endpoint_url: 
+                requests.get(endpoint_url)
+
+        click.echo(deployed_string)
 
         return
 
@@ -437,8 +493,8 @@ class ZappaCLI(object):
             api_id = self.zappa.get_api_id(self.lambda_name)
             self.zappa.remove_api_key(api_id, self.api_stage)
 
-        gateway_id = self.zappa.undeploy_api_gateway( 
-            self.lambda_name, 
+        gateway_id = self.zappa.undeploy_api_gateway(
+            self.lambda_name,
             domain_name=domain_name
         )
 
@@ -448,7 +504,7 @@ class ZappaCLI(object):
         if remove_logs:
             self.zappa.remove_lambda_function_logs(self.lambda_name)
 
-        print("Done!")
+        click.echo(click.style("Done", fg="green", bold=True) + "!")
 
     def schedule(self):
         """
@@ -640,10 +696,10 @@ class ZappaCLI(object):
         for api_key in self.zappa.get_api_keys(api_id, self.api_stage):
             tabular_print("API Gateway x-api-key", api_key)
 
-        # There literally isn't a better way to do this. 
+        # There literally isn't a better way to do this.
         # AWS provides no way to tie a APIGW domain name to its Lambda funciton.
         domain_url = self.stage_config.get('domain', None)
-        if domain_url: 
+        if domain_url:
             tabular_print("Domain URL", 'https://' + domain_url)
         else:
             tabular_print("Domain URL", "None Supplied")
@@ -832,8 +888,8 @@ class ZappaCLI(object):
 
         if 's3://' in account_key_location:
             bucket = account_key_location.split('s3://')[1].split('/')[0]
-            key_name = account_key_location.split('s3://')[1].split('/')[0]
-            s3_client.download_file(bucket, key_name, '/tmp/account.key')
+            key_name = account_key_location.split('s3://')[1].split('/')[1]
+            self.zappa.s3_client.download_file(bucket, key_name, '/tmp/account.key')
         else:
             from shutil import copyfile
             copyfile(account_key_location, '/tmp/account.key')
@@ -843,9 +899,9 @@ class ZappaCLI(object):
         # Get cert and update domain.
         from letsencrypt import get_cert_and_update_domain, cleanup
         cert_success = get_cert_and_update_domain(
-                self.zappa, 
+                self.zappa,
                 self.lambda_name,
-                self.api_stage, 
+                self.api_stage,
                 domain
             )
         cleanup()
@@ -952,17 +1008,17 @@ class ZappaCLI(object):
             self.api_stage].get('django_settings', None)
         self.manage_roles = self.zappa_settings[
             self.api_stage].get('manage_roles', True)
-        self.api_key_required = self.zappa_settings[
-            self.api_stage].get('api_key_required', False)
+        self.api_key_required = self.stage_config.get('api_key_required', False)
         self.api_key = self.zappa_settings[
             self.api_stage].get('api_key')
+        self.iam_authorization = self.stage_config.get('iam_authorization', False)
         self.lambda_description = self.zappa_settings[
             self.api_stage].get('lambda_description', "Zappa Deployment")
         self.environment_variables = self.zappa_settings[
             self.api_stage].get('environment_variables', {})
 
-        self.zappa = Zappa( boto_session=session, 
-                            profile_name=self.profile_name, 
+        self.zappa = Zappa( boto_session=session,
+                            profile_name=self.profile_name,
                             aws_region=self.aws_region,
                             load_credentials=self.load_credentials
                             )
@@ -984,7 +1040,10 @@ class ZappaCLI(object):
         """
 
         with open(settings_file) as json_file:
-            self.zappa_settings = json.load(json_file)
+            try:
+                self.zappa_settings = json.load(json_file)
+            except ValueError:
+                raise ValueError("Unable to load the zappa settings JSON. It may be malformed.")
 
     def create_package(self):
         """
@@ -1046,7 +1105,7 @@ class ZappaCLI(object):
                         self.remote_env_file
                     )
 
-                # Local envs    
+                # Local envs
                 settings_s = settings_s + "ENVIRONMENT_VARIABLES={0}\n".format(
                         dict(self.environment_variables)
                     )
@@ -1065,11 +1124,22 @@ class ZappaCLI(object):
                 else:
                     settings_s = settings_s + "DJANGO_SETTINGS=None\n"
 
+                # AWS Events function mapping
+                event_mapping = {}
+                events = self.stage_config.get('events', [])
+                for event in events:
+                    arn = event.get('event_source', {}).get('arn')
+                    function = event.get('function')
+                    if arn and function:
+                        event_mapping[arn] = function
+                settings_s = settings_s + "AWS_EVENT_MAPPING={0!s}\n".format(event_mapping)
+
                 # Copy our Django app into root of our package.
                 # It doesn't work otherwise.
-                base = __file__.rsplit(os.sep, 1)[0]
-                django_py = ''.join(os.path.join([base, os.sep, 'ext', os.sep, 'django.py']))
-                lambda_zip.write(django_py, 'django_zappa_app.py')
+                if self.django_settings:
+                    base = __file__.rsplit(os.sep, 1)[0]
+                    django_py = ''.join(os.path.join([base, os.sep, 'ext', os.sep, 'django_zappa.py']))
+                    lambda_zip.write(django_py, 'django_zappa_app.py')
 
                 # Lambda requires a specific chmod
                 temp_settings = tempfile.NamedTemporaryFile(delete=False)
@@ -1084,7 +1154,7 @@ class ZappaCLI(object):
         Remove our local zip file.
         """
 
-        if self.stage_config.get('delete_zip', True):
+        if self.stage_config.get('delete_local_zip', True):
             try:
                 os.remove(self.zip_path)
             except Exception as e: # pragma: no cover
@@ -1096,10 +1166,8 @@ class ZappaCLI(object):
         """
 
         # Remove the uploaded zip from S3, because it is now registered..
-        self.zappa.remove_from_s3(self.zip_path, self.s3_bucket_name)
-
-        # Finally, delete the local copy our zip package
-        self.remove_local_zip()
+        if self.stage_config.get('delete_s3_zip', True):
+            self.zappa.remove_from_s3(self.zip_path, self.s3_bucket_name)
 
     def print_logs(self, logs):
         """
@@ -1163,16 +1231,19 @@ def handle(): # pragma: no cover
     except SystemExit as e: # pragma: no cover
         if cli.zip_path:
             cli.remove_uploaded_zip()
+            cli.remove_local_zip()
 
         sys.exit(e.code)
 
     except KeyboardInterrupt: # pragma: no cover
         if cli.zip_path: # Remove the Zip from S3 upon failure.
             cli.remove_uploaded_zip()
+            cli.remove_local_zip()
         sys.exit(130)
     except Exception as e:
         if cli.zip_path: # Remove the Zip from S3 upon failure.
             cli.remove_uploaded_zip()
+            cli.remove_local_zip()
 
         click.echo("Oh no! An " + click.style("error occured", fg='red', bold=True) + "! :(")
         click.echo("\n==============\n")

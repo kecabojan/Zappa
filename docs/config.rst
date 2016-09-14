@@ -11,6 +11,7 @@ Envirnments, such as *dev*, *staging*, and *production* are configured in the *z
             "api_key_required": false, // enable securing API Gateway endpoints with x-api-key header (default False)
             "assume_policy": "my_assume_policy.json", //
             "attach_policy": "my_attach_policy.json", // optional, IAM attach policy JSON file
+            "authorization_type": "NONE", // optional, use "AWS_IAM" to require request signing
             "aws_region": "us-east-1",
             "cache_cluster_enabled": false,
             "cache_cluster_size": .5,
@@ -83,6 +84,10 @@ attach_policy
 =============
 (Optional) IAM attach policy JSON file
 
+authorization_type
+==================
+(Optional) Default `NONE`. Use `AWS_IAM` to require signed requests
+
 callbacks
 =========
 
@@ -114,10 +119,16 @@ debug
 
 This boolean setting governs whether Zappa configuration errors tracebacks are to appear in HTTP 500 error pages.
 
-delete_zip
+
+delete_local_zip
 ==========
 
-This boolean setting specifies wheter to delete the local zip archive after code updates.
+This boolean setting specifies whether to delete the local zip archive after code updates.
+
+delete_s3_zip
+==========
+
+This boolean setting specifies whether to delete the s3 zip archive after code updates.
 
 domain
 ======

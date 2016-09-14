@@ -8,7 +8,7 @@
 [![Coverage](https://img.shields.io/coveralls/Miserlou/Zappa.svg)](https://coveralls.io/github/Miserlou/Zappa)
 [![Requirements Status](https://requires.io/github/Miserlou/Zappa/requirements.svg?branch=master)](https://requires.io/github/Miserlou/Zappa/requirements/?branch=master)
 [![PyPI](https://img.shields.io/pypi/v/Zappa.svg)](https://pypi.python.org/pypi/zappa)
-[![Slack](https://img.shields.io/badge/chat-slack-ff69b4.svg)](https://slackautoinviter.herokuapp.com/)
+[![Slack](https://img.shields.io/badge/chat-slack-ff69b4.svg)](https://slack.zappa.io/)
 
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
@@ -34,7 +34,8 @@
     - [Keeping The Server Warm](#keeping-the-server-warm)
     - [Serving Static Files / Binary Uploads](#serving-static-files--binary-uploads)
     - [Enabling CORS](#enabling-cors)
-    - [Enabling Secure Endpoints on API Gateway](#enabling-secure-endpoints-on-api-gateway)
+    - [Enabling Secure Endpoints on API Gateway (API Key)](#enabling-secure-endpoints-on-api-gateway-api-key)
+    - [Enabling Secure Endpoints on API Gateway (IAM Policy)](#enabling-secure-endpoints-on-api-gateway-iam-policy)
     - [Deploying to a Domain With a Let's Encrypt Certificate (DNS Auth)](#deploying-to-a-domain-with-a-lets-encrypt-certificate-dns-auth)
     - [Deploying to a Domain With a Let's Encrypt Certificate (HTTP Auth)](#deploying-to-a-domain-with-a-lets-encrypt-certificate-http-auth)
     - [Setting Environment Variables](#setting-environment-variables)
@@ -42,11 +43,15 @@
       - [Remote Environment Variables](#remote-environment-variables)
     - [Setting Integration Content-Type Aliases](#setting-integration-content-type-aliases)
     - [Catching Unhandled Exceptions](#catching-unhandled-exceptions)
+    - [Using Custom AWS IAM Roles and Policies](#using-custom-aws-iam-roles-and-policies)
 - [Zappa Guides](#zappa-guides)
 - [Zappa in the Press](#zappa-in-the-press)
 - [Sites Using Zappa](#sites-using-zappa)
+- [Related Projects](#related-projects)
 - [Hacks](#hacks)
 - [Contributing](#contributing)
+    - [Using a Local Repo](#using-a-local-repo)
+- [Support / Development / Training / Consulting](#support--development--training--consulting)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
@@ -109,7 +114,7 @@ Next, you'll need to define your local and server-side settings.
 
     $ zappa init
 
-This will automatically detect your application type (Flask, Django, etc.) and help you define your deployment configuration settings. Once you finish initialization, you'll have a file named *zappa_settings.json* in your project directory defining your basic deployment settings. It will probably look something like this for most WSGI apps:
+This will automatically detect your application type (Flask/Django - Pyramid users [see here](https://github.com/Miserlou/Zappa/issues/278#issuecomment-241917956)) and help you define your deployment configuration settings. Once you finish initialization, you'll have a file named *zappa_settings.json* in your project directory defining your basic deployment settings. It will probably look something like this for most WSGI apps:
 
 ```javascript
 {
@@ -167,7 +172,7 @@ You can also `rollback` the deployed code to a previous version by supplying the
 
 #### Scheduling
 
-Zappa can be used to easily schedule functions to occur on regular intervals.
+Zappa can be used to easily schedule functions to occur on regular intervals. This provides a much nicer, maintenance-free alternative to Celery!
 These functions will be packaged and deployed along with your `app_function` and called from the handler automatically.
 Just list your functions and the expression to schedule them using [cron or rate syntax](http://docs.aws.amazon.com/lambda/latest/dg/tutorial-scheduled-events-schedule-expressions.html) in your *zappa_settings.json* file:
 
@@ -227,6 +232,22 @@ And then:
     $ zappa schedule production
 
 And now your function will execute every time a new upload appears in your bucket!
+
+Similarly, for a [Simple Notification Service](https://aws.amazon.com/sns/) event:
+
+```javascript
+        "events": [
+            {
+                "function": "your_module.your_function",
+                "event_source": {
+                    "arn":  "arn:aws:sns:::your-event-topic-arn",
+                    "events": [
+                        "sns:Publish"
+                    ]
+                }
+            }
+        ]
+```
 
 #### Undeploy
 
@@ -309,7 +330,8 @@ to change Zappa's behavior. Use these at your own risk!
         "cloudwatch_data_trace": false, // Logs all data about received events.
         "cloudwatch_metrics_enabled": false, // Additional metrics for the API Gateway.
         "debug": true, // Print Zappa configuration errors tracebacks in the 500
-        "delete_zip": true, // Delete the local zip archive after code updates
+        "delete_local_zip": true, // Delete the local zip archive after code updates
+        "delete_s3_zip": true, // Delete the s3 zip archive
         "django_settings": "your_project.production_settings", // The modular path to your Django project's settings. For Django projects only.
         "domain": "yourapp.yourdomain.com", // Required if you're using a domain
         "environment_variables": {"your_key": "your_value"}, // A dictionary of environment variables that will be available to your deployed app. See also "remote_env_file". Default {}.
@@ -331,6 +353,7 @@ to change Zappa's behavior. Use these at your own risk!
         "exception_handler": "your_module.report_exception", // function that will be invoked in case Zappa sees an unhandled exception raised from your code
         "exclude": ["*.gz", "*.rar"], // A list of regex patterns to exclude from the archive
         "http_methods": ["GET", "POST"], // HTTP Methods to route,
+        "iam_authorization": true, // optional, use IAM to require request signing. Default false.
         "integration_response_codes": [200, 301, 404, 500], // Integration response status codes to route
         "integration_content_type_aliases": { // For routing requests with non-standard mime types
             "application/json": [
@@ -393,9 +416,15 @@ Similarly, you will not be able to accept binary multi-part uploads through the 
 
 To enable Cross-Origin Resource Sharing (CORS) for your application, follow the [AWS "How to CORS" Guide](https://docs.aws.amazon.com/apigateway/latest/developerguide/how-to-cors.html) to enable CORS via the API Gateway Console. Don't forget to enable CORS per parameter and re-deploy your API after making the changes!
 
-#### Enabling Secure Endpoints on API Gateway
+You can also simply handle CORS directly in your application. If you do this, you'll need to add `Access-Control-Allow-Origin`, `Access-Control-Allow-Headers`, and `Access-Control-Allow-Methods` to the `method_header_types` key in your `zappa_settings.json`. See further [discussion here](https://github.com/Miserlou/Zappa/issues/41).
+
+#### Enabling Secure Endpoints on API Gateway (API Key)
 
 You can use the `api_key_required` setting to generate and assign an API key to all the routes of your API Gateway. After redeployment, you can then pass the provided key as a header called `x-api-key` to access the restricted endpoints. Without the `x-api-key` header, you will receive a 403. [More information on API keys in the API Gateway](http://docs.aws.amazon.com/apigateway/latest/developerguide/how-to-api-keys.html)
+
+#### Enabling Secure Endpoints on API Gateway (IAM Policy)
+
+You can enable IAM-based (v4 signing) authorization on an API by setting the `iam_authorization` setting to `true`. Your API will then require signed requests and access can be controlled via [IAM policy](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-iam-policy-examples.html). Unsigned requests will receive a 403 response, as will requesters who are not authorized to access the API.
 
 #### Deploying to a Domain With a Let's Encrypt Certificate (DNS Auth)
 
@@ -503,11 +532,33 @@ The function has to accept three arguments: exception, event, and context:
 
 your_module.py
 ```python
-def unhandled_exceptions(e, event, context):
+def unhandled_exception(e, event, context):
     send_to_raygun(e, event)  # gather data you need and send
+    return True # Prevent invocation retry
+```
+You may still need a similar exception handler inside your application, this is just a way to catch exception which happen at the Zappa/WSGI layer (typically event-based invocations, misconfigured settings, bad Lambda packages, and permissions issues).
+
+By default, AWS Lambda will attempt to retry an event based (non-API Gateway, e.g. CloudWatch) invocation if an exception has been thrown. However, you can prevent this by returning True, as in example above, so Zappa that will not re-raise the uncaught exception, thus preventing AWS Lambda from retrying the current invocation.
+
+#### Using Custom AWS IAM Roles and Policies
+
+By default, the Zappa client will create and manage the necessary IAM policies and roles to deploy and execute Zappa applications. However, if you're using Zappa in a corporate environment or as part of a continuous integration, you may instead want to manually manage your policies instead. 
+
+To manually define the permissions policy of your Zappa execution role, you must define the following in your *zappa_settings.json*:
+
+```javascript
+{
+    "dev": {
+        ...
+        "manage_roles": false, // Disable Zappa client managing roles.
+        "role_name": "MyLambdaRole", // Name of your Zappa execution role. Default ZappaExecutionRole.
+        ...
+    },
+    ...
+}
 ```
 
-You'll still need a similar exception handler inside your application, this is just a way to catch exception which happen at the Zappa/WSGI layer (typically misconfigured settings, bad Lambda packages, and permissions issues.)
+Ongoing discussion about the minimum policy requirements necessary for a Zappa deployment [can be found here](https://github.com/Miserlou/Zappa/issues/244).
 
 ## Zappa Guides
 
@@ -526,10 +577,12 @@ You'll still need a similar exception handler inside your application, this is j
 
 ## Sites Using Zappa
 
-* [zappa.gun.io](https://zappa.gun.io) - A Zappa "Hello, World" (real homepage coming.. soon..)
+* [Zappa.io](https://www.zappa.io) - A simple Zappa homepage
 * [Mailchimp Signup Utility](https://github.com/sasha42/Mailchimp-utility) - A microservice for adding people to a mailing list via API.
 * [Zappa Slack Inviter](https://github.com/Miserlou/zappa-slack-inviter) - A tiny, server-less service for inviting new users to your Slack channel.
 * [Serverless Image Host](https://github.com/Miserlou/serverless-imagehost) - A thumbnailing service with Flask, Zappa and Pillow.
+* [Gigger](https://www.gigger.rocks/) - The live music industry's search engine
+* And many more!
 
 Are you using Zappa? Let us know and we'll list your site here!
 
@@ -539,6 +592,7 @@ Are you using Zappa? Let us know and we'll list your site here!
 * [zappa-cms](http://github.com/Miserlou/zappa-cms) - A tiny server-less CMS for busy hackers. Work in progress.
 * [flask-ask](https://github.com/johnwheeler/flask-ask) - A framework for building Amazon Alexa applications. Uses Zappa for deployments.
 * [zappa-file-widget](https://github.com/anush0247/zappa-file-widget) - A Django plugin for supporting binary file uploads in Django on Zappa.
+* [zops](https://github.com/bjinwright/zops) - Utilities for teams and continuous integrations using Zappa. 
 
 ## Hacks
 
@@ -562,3 +616,21 @@ Please also write comments along with your new code, including the URL of the ti
 #### Using a Local Repo
 
 To use the git HEAD, you *can't* use `pip install -e `. Instead, you should clone the repo to your machine and then `pip install /path/to/zappa/repo` or `ln -s /path/to/zappa/repo/zappa zappa` in your local project.
+
+## Support / Development / Training / Consulting
+
+Do you need help with..
+ 
+  * Porting existing Flask and Django applications to Zappa?
+  * Building new applications and services that scale infinitely?
+  * Reducing your operations and hosting costs?
+  * Adding new custom features into Zappa?
+  * Training your team to use AWS and other server-less paradigms?
+
+Good news! We're currently available for remote and on-site consulting for small, large and enterprise teams. Please contact <miserlou@gmail.com> with your needs and let's work together!
+
+<br />
+<p align="center">
+  <a href="https://gun.io"><img src="http://i.imgur.com/M7wJipR.png" alt="Made by Gun.io"/></a>
+</p>
+
